@@ -9,7 +9,7 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.pos = 'center')
 library(tidyverse)
 library(latex2exp)
 library(ggthemes)
@@ -22,7 +22,7 @@ theme_set(theme_tufte())
 ## The Urban Observatory
 
 > - Sensors stream live data from around Newcastle upon Tyne and Gateshead
-> - A variety of different sensor readings such as NO, NO_2_, Temperature and Humidity 
+> - A variety of different sensor readings such as NO, NO<sub>2</sub>, Temperature and Humidity 
 > - Sample sporadically and inaccurately
 > - Are not positioned optimally
 > - Can we use statistical modelling to determine the true nature of the environmental process 
@@ -57,14 +57,7 @@ emote %>%
        subtitle = "Raw readings of sensor data at emote_1108")
 ```
 
-## Statistical Methodology for Time Series Data
-
-> - Bayesian modelling for interpretable results and accurate uncertainty
-> - Dynamic Linear Models using the Kalman Filter
-> - Particle Filtering for flexibly fitting continuous time non-Gaussian Models
-> - MCMC and pMCMC to determine static parameters
-
-## Model Fitting
+## Interpolating the Missing Data
 
 ```{r gibbs-sampling}
 sample_w <- function(theta, mod, shape_w, rate_w) {
@@ -89,6 +82,17 @@ sample_v <- function(y, theta, mod, shape_v, rate_v) {
              rate = rate_v + 0.5 * SSy)
 }
 
+sample_v_wishart <- function(y, theta, mod, nu, psi) {
+  p <- ncol(y)
+  y_center <- center_y(y, theta, mod)
+  SSy <- drop(crossprod(na.omit(y_center))) 
+
+  dof <- nu + n
+  scale <- psi + SSy
+
+  MCMCpack::riwish(1, v = dof, S = scale)
+}
+
 dlm_gibbs <- function(y, mod, theta, shape_v, rate_v, shape_w, rate_w, m) {
   p <- nrow(mod(theta)$FF)
   d <- nrow(mod(theta)$GG)
@@ -111,9 +115,7 @@ dlm_gibbs <- function(y, mod, theta, shape_v, rate_v, shape_w, rate_w, m) {
 }
 ```
 
-> - Using a Dynamic linear model
-> - Centre and scale the data (subtract sample mean, divide by sample standard deviation)
-> - Select humidity and temperature data
+ - Centre and scale the data (subtract sample mean, divide by sample standard deviation)
 
 ```{r}
 rounded_data <- emote %>% 
@@ -139,7 +141,13 @@ emote %>%
   facet_wrap(~key, ncol = 2)
 ``` 
 
-## Determine the static parameters
+## Fit a Parametric Model
+
+$$\begin{align}
+y_t &= Fx_t + v_t, &v_t &\sim \mathcal{N}(0, V), \\
+x_t &= Gx_{t-1} + v_t, &v_t &\sim \mathcal{N}(0, W), \\
+x_0 &\sim \mathcal{N}(m_0, C_0).
+\end{align}$$
 
 ```{r model}
 multivariate_model <- function(theta) {
@@ -190,11 +198,27 @@ temp_humid_chains <- read_rds(path = "models/temp_humid_chains.Rds")
 ```
 
 ```{r}
-temp_humid_chains %>% 
-  filter(iteration > 1000) %>% 
-  thin(10) %>% 
-  gather(key = Parameter, value, -chain, -iteration) %>% 
-    jonnylaw::density_plot()
+chains <- 
+  temp_humid_chains %>% 
+    filter(iteration > 1000) %>% 
+    thin(10) %>% 
+    gather(key = Parameter, value, -chain, -iteration) 
+
+chains %>% 
+    ggplot2::ggplot() +
+    ggplot2::geom_density(ggplot2::aes(x = value, fill = as.factor(chain)), alpha = 0.5) +
+    ggforce::facet_wrap_paginate(~Parameter, scales = "free", nrow = 3, ncol = 3, strip.position = "right", page = 1) +
+    ggplot2::theme(legend.position = "none")
+```
+
+-------
+
+```{r}
+chains %>% 
+    ggplot2::ggplot() +
+    ggplot2::geom_density(ggplot2::aes(x = value, fill = as.factor(chain)), alpha = 0.5) +
+    ggforce::facet_wrap_paginate(~Parameter, scales = "free", nrow = 3, ncol = 3, strip.position = "right", page = 2) +
+    ggplot2::theme(legend.position = "none")
 ```
 
 ## One Step Forecasting using the Kalman Filter
