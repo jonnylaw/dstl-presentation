@@ -1,0 +1,274 @@
+---
+title: "Bayesian Modelling of Urban Observatory Data"
+author: "Jonny Law"
+date: "14 August 2019"
+output:
+  ioslides_presentation:
+    logo: figures/NewcastleLogo.svg
+    css: my_presentation.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(latex2exp)
+library(ggthemes)
+library(leaflet)
+library(jonnylaw)
+theme_set(theme_tufte())
+```
+
+## The Urban Observatory
+
+> - Sensors stream live data from around Newcastle upon Tyne and Gateshead
+> - A variety of different sensor readings such as NO, NO_2_, Temperature and Humidity 
+> - Sample sporadically and inaccurately
+> - Are not positioned optimally
+> - Can we use statistical modelling to determine the true nature of the environmental process 
+> - Performing forecasting in time, spatial interpolation and correction of inaccurate readings
+
+## Environment Sensors
+
+```{r, fig.align='center'}
+locations = read_csv("data/locations.csv")
+## Output a leaflet map of sensor locations
+## Remove misspecified sensor locations (with lat & lon = 0.0)
+leaflet(locations %>% 
+  filter(latitude != 0.0)) %>%
+  addTiles() %>%
+  addMarkers(~longitude, ~latitude, popup = ~ paste(name, reading, sep = "\n"))
+```
+
+## Environment Sensors
+
+```{r read_data, cache=TRUE}
+emote = read_csv("data/sensor_data.csv")
+```
+
+```{r plot_environment_sensor}
+emote %>%
+  mutate(Variable = paste0(Variable, " (", Units, ")")) %>%
+  ggplot(aes(x = Timestamp, y = Value, colour = Variable)) +
+  geom_point(size = 0.1) +
+  facet_wrap(~Variable, scales = "free_y") +
+  theme(legend.position = "none") +
+  labs(title = "Environmental Sensor Readings", 
+       subtitle = "Raw readings of sensor data at emote_1108")
+```
+
+## Statistical Methodology for Time Series Data
+
+> - Bayesian modelling for interpretable results and accurate uncertainty
+> - Dynamic Linear Models using the Kalman Filter
+> - Particle Filtering for flexibly fitting continuous time non-Gaussian Models
+> - MCMC and pMCMC to determine static parameters
+
+## Model Fitting
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r gibbs-sampling}
+sample_w <- function(theta, mod, shape_w, rate_w) {
+  n <- nrow(theta) - 1
+  d <- ncol(theta)
+  theta_center <- theta[-1, , drop = FALSE] - tcrossprod(theta[-(n + 1), , drop = FALSE], mod$GG)
+  SStheta <- drop(sapply(1:d, function(i) crossprod(theta_center[, i])))
+  SStheta <- colSums((theta[-1, 1:d, drop = FALSE] - tcrossprod(theta[-(n + 1), , drop = FALSE], mod$GG)[, 1:d])^2)
+
+  1 / rgamma(d, shape = shape_w + 0.5 * (n),
+             rate = rate_w + 0.5 * SStheta)
+}
+
+center_y <- function(y, theta, mod) 
+  y - tcrossprod(theta[-1, , drop = FALSE], mod$FF)
+
+sample_v <- function(y, theta, mod, shape_v, rate_v) {
+  p <- ncol(y)
+  y_center <- center_y(y, theta, mod)
+  SSy <- drop(crossprod(na.omit(y_center))) 
+  1 / rgamma(p, shape = shape_v + 0.5 * nrow(y), 
+             rate = rate_v + 0.5 * SSy)
+}
+
+dlm_gibbs <- function(y, mod, theta, shape_v, rate_v, shape_w, rate_w, m) {
+  p <- nrow(mod(theta)$FF)
+  d <- nrow(mod(theta)$GG)
+  v <- matrix(NA_real_, nrow = m, ncol = p)
+  w <- matrix(NA_real_, nrow = m, ncol = d)
+  v[1,] <- theta[1:p]
+  w[1,] <- theta[(p+1):(p+d)]
+  theta <- c(w[1,], v[1,])
+  for (i in seq_len(m)) {
+    filtered <- dlmFilter(y, mod(theta))
+    sampled <- dlmBSample(filtered)
+    w[i,] <- sample_w(sampled, mod(theta), shape_w, rate_w)
+    v[i,] <- sample_v(y, sampled, mod(theta), shape_v, rate_v)
+    theta <- c(w[i,], v[i,])
+  }
+  out <- cbind(w, v) %>% as_tibble()
+  colnames(out) <- c(paste0("w", seq_len(d)), paste0("v", seq_len(p)))
+  out %>% 
+    add_column(iteration = seq_len(m))
+}
+```
+
+> - Using a Dynamic linear model
+> - Centre and scale the data (subtract sample mean, divide by sample standard deviation)
+> - Select humidity and temperature data
+
+```{r}
+rounded_data <- emote %>% 
+  filter(Variable %in% c("Temperature", "Humidity")) %>% 
+  spread(key = Variable, value = Value) %>% 
+  select(timestamp = Timestamp, Humidity, Temperature) %>% 
+  mutate(timestamp = lubridate::round_date(timestamp, unit = "1 hour")) %>% 
+  group_by(timestamp) %>% 
+  summarise_at(vars(Humidity, Temperature), mean, na.rm = T)
+
+emote <- rounded_data %>% 
+  expand(timestamp = seq(from = lubridate::round_date(min(timestamp), "1 hour"), to = lubridate::round_date(max(timestamp), "1 hour"), by = "1 hour")) %>% 
+  left_join(rounded_data) %>% 
+  mutate(mean_humidity = mean(Humidity, na.rm = T), sd_humidity = sd(Humidity, na.rm = T),
+         mean_temperature = mean(Temperature, na.rm = T), sd_temperature = sd(Temperature, na.rm = T)) %>% 
+  mutate(norm_humidity = (Humidity - mean_humidity) / sd_humidity, 
+         norm_temperature = (Temperature - mean_temperature) / sd_temperature)
+
+emote %>% 
+  gather(key, value, norm_humidity, norm_temperature) %>% 
+  ggplot(aes(x = timestamp, y = value, colour = key)) +
+  geom_line() +
+  facet_wrap(~key, ncol = 2)
+``` 
+
+## Determine the static parameters
+
+```{r model}
+multivariate_model <- function(theta) {
+  (dlmModPoly(order = 1, dV = theta[1], dW = theta[3]) + 
+    dlmModTrig(s = 24, q = 3, dV = 0, dW = theta[4:9])) %+%
+  (dlmModPoly(order = 1, dV = theta[2], dW = theta[10]) + 
+    dlmModTrig(s = 24, q = 3, dV = 0, dW = theta[11:16]))
+}
+```
+
+
+```{r mle, eval=FALSE}
+ys <- emote %>% 
+  select(norm_humidity, norm_temperature) %>% 
+  as.matrix()
+fit <- dlmMLE(ys, parm = rep(1, times = 16), build = multivariate_model)
+write_rds(fit, "models/mle_fit.Rds")
+```
+
+```{r}
+fit <- read_rds(path = "models/mle_fit.Rds")
+```
+
+```{r chains, eval=FALSE}
+future::plan(future::multiprocess)
+temp_humid_chains <- furrr::future_map_dfr(
+  .x = 1:2,
+  .f = function(x)
+    dlm_gibbs(
+      y = ys,
+      mod = multivariate_model,
+      theta = fit$par,
+      shape_v = 2.0,
+      rate_v = 3.0,
+      shape_w = 2.0,
+      rate_w = 3.0,
+      m = 5e3
+    ),
+  .id = "chain"
+)
+write_rds(x = temp_humid_chains, "models/temp_humid_chains.Rds")
+```
+
+```{r}
+temp_humid_chains <- read_rds(path = "models/temp_humid_chains.Rds")
+```
+
+```{r}
+temp_humid_chains %>% 
+  filter(iteration > 1000) %>% 
+  thin(10) %>% 
+  gather(key = Parameter, value, -chain, -iteration) %>% 
+    jonnylaw::density_plot()
+```
+
+## One Step Forecasting using the Kalman Filter
+
+```{r interpolation-filter}
+theta_mean <- temp_humid_chains %>% 
+  summarise_at(vars(2:17), mean) %>% 
+  .[1,]
+filtered <- dlmFilter(y = ys, mod = multivariate_model(theta_mean))
+f <- multivariate_model(theta_mean)$FF
+v <- multivariate_model(theta_mean)$V
+rt <- dlmSvd2var(u = filtered$U.R, d = filtered$D.R)
+qt <- map(rt, ~ f %*% . %*% t(f) + v)
+
+humid <- emote %>% 
+  add_column(pred_humid = filtered$f[,1],
+             variance_humid = qt %>% map(~ .[1,1]) %>% unlist()) %>% 
+  filter(timestamp > "2017-09-01") %>% 
+  mutate(upper = qnorm(p = 0.975, mean = pred_humid, sd = sqrt(variance_humid)),
+         lower = qnorm(p = 0.025, mean = pred_humid, sd = sqrt(variance_humid))) %>% 
+  gather(key, value, pred_humid, norm_humidity) %>% 
+  ggplot(aes(x = timestamp, y = value, colour = key)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), colour = NA, alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(-10, 10))
+
+temp <- emote %>% 
+  add_column(pred_temp = filtered$f[,2],
+             variance_temp = qt %>% map(~ .[2,2]) %>% unlist()) %>% 
+    filter(timestamp > "2017-09-01") %>% 
+  mutate(upper = qnorm(p = 0.975, mean = pred_temp, sd = sqrt(variance_temp)),
+       lower = qnorm(p = 0.025, mean = pred_temp, sd = sqrt(variance_temp))) %>% 
+  gather(key, value, pred_temp, norm_temperature) %>% 
+  ggplot(aes(x = timestamp, y = value, colour = key)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), colour = NA, alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(-19, 10))
+
+gridExtra::grid.arrange(humid, temp)
+```
+
+## Interpolation using Smoothing
+
+```{r smoothed-interpolation}
+smoothed <- dlmSmooth(filtered)
+smoothed_states <- smoothed$s
+pred <- apply(smoothed_states, 1, function(x) f %*% x)
+rt <- dlmSvd2var(u = smoothed$U.S, d = smoothed$D.S)
+pred_var <- map(rt, ~ f %*% . %*% t(f) + v)
+
+humid <- emote %>% 
+  add_column(pred_humid = pred[1,-1],
+             variance_humid = pred_var %>% map(~ .[1,1]) %>% unlist() %>% .[-1]) %>% 
+  filter(timestamp > "2017-09-01") %>% 
+  mutate(upper = qnorm(p = 0.975, mean = pred_humid, sd = sqrt(variance_humid)),
+         lower = qnorm(p = 0.025, mean = pred_humid, sd = sqrt(variance_humid))) %>% 
+  gather(key, value, pred_humid, norm_humidity) %>% 
+  ggplot(aes(x = timestamp, y = value, colour = key)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), colour = NA, alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(-10, 10))
+
+temp <- emote %>% 
+  add_column(pred_temp = pred[2,-1],
+           variance_temp = pred_var %>% map(~ .[1,1]) %>% unlist() %>% .[-1]) %>% 
+  mutate(upper = qnorm(p = 0.975, mean = pred_temp, sd = sqrt(variance_temp)),
+       lower = qnorm(p = 0.025, mean = pred_temp, sd = sqrt(variance_temp))) %>%   
+  filter(timestamp > "2017-09-01") %>% 
+  gather(key, value, pred_temp, norm_temperature) %>% 
+  ggplot(aes(x = timestamp, y = value, colour = key)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), colour = NA, alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(-10, 10))
+
+gridExtra::grid.arrange(humid, temp)
+```
