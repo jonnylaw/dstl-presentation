@@ -145,7 +145,7 @@ emote %>%
 
 $$\begin{align}
 y_t &= Fx_t + v_t, &v_t &\sim \mathcal{N}(0, V), \\
-x_t &= Gx_{t-1} + v_t, &v_t &\sim \mathcal{N}(0, W), \\
+x_t &= Gx_{t-1} + w_t, &w_t &\sim \mathcal{N}(0, W), \\
 x_0 &\sim \mathcal{N}(m_0, C_0).
 \end{align}$$
 
